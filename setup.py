@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="pyolia-us",  # New unique name
+    name="pyolia-US",  # New unique name
     version="0.1.0",
     author="selmer512",
     author_email="admin@cyberhoney.one",  # (PyPI will require a valid email)
