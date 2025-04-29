@@ -1,31 +1,15 @@
 """ Python wrapper for the Veolia unofficial API """
-from __future__ import annotations
+import asyncio
+import logging
+from typing import Optional, List
 
-import csv
-from datetime import date, datetime, timedelta
-from types import TracebackType
-from typing import Any, Dict, List, Mapping, Union
+import aiohttp
+from bs4 import BeautifulSoup
 
-import backoff
-from aiohttp import ClientSession
+_LOGGER = logging.getLogger(__name__)
 
-JSON = Union[Dict[str, Any], List[Dict[str, Any]]]
-
-DOMAIN = "https://www.eau-services.com"
-LOGIN_URL = f"{DOMAIN}/default.aspx"
-DATA_URL = f"{DOMAIN}/mon-espace-suivi-personnalise.aspx?ex=1&mm={{}}/{{}}"
-DATA_URL_DAY = f"{DATA_URL}&d={{}}"
-
-CSV_DELIMITER = ";"
-CONSUMPTION_HEADER = "consommation(litre)"
-
-
-async def relogin(invocation: Mapping[str, Any]) -> None:
-    await invocation["args"][0].login()
-
-
-class NotAuthenticatedException(Exception):
-    pass
+BASE_URL = "https://mywater.veolia.us"
+LOGIN_URL = f"{BASE_URL}/user/login"
 
 
 class BadCredentialsException(Exception):
@@ -33,111 +17,72 @@ class BadCredentialsException(Exception):
 
 
 class VeoliaClient:
-    """Interface class for the Veolia unofficial API"""
-
-    def __init__(
-        self,
-        username: str,
-        password: str,
-        session: ClientSession | None = None,
-    ) -> None:
-        """
-        Constructor
-
-        :param username: the username for eau-services.com
-        :param password: the password for eau-services.com
-        :param session: optional ClientSession
-        """
-
+    def __init__(self, username: str, password: str, session: Optional[aiohttp.ClientSession] = None):
         self.username = username
         self.password = password
-        self.session = session if session else ClientSession()
+        self.session = session or aiohttp.ClientSession()
+        self.logged_in = False
 
-    async def __aenter__(self) -> VeoliaClient:
-        return self
+    async def login(self):
+        _LOGGER.debug("Fetching login page to retrieve form_build_id...")
 
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None:
-        await self.close()
+        async with self.session.get(LOGIN_URL) as resp:
+            if resp.status != 200:
+                raise Exception("Failed to load login page")
+            html = await resp.text()
 
-    async def close(self) -> None:
-        """Close the session."""
-        await self.session.close()
+        soup = BeautifulSoup(html, "html.parser")
+        form_build_id_element = soup.find("input", {"name": "form_build_id"})
+        if not form_build_id_element:
+            raise Exception("form_build_id not found in login page")
 
-    @property
-    def last_report_date(self) -> date:
-        """Date since which reports have been published."""
-        return datetime.now().date() - timedelta(days=3)
+        form_build_id = form_build_id_element.get("value")
 
-    @backoff.on_exception(
-        backoff.expo,
-        NotAuthenticatedException,
-        max_tries=2,
-        on_backoff=relogin,
-    )
-    async def get_consumption(
-        self, month: int, year: int, day: int | None = None
-    ) -> list[int]:
-        """
-        If day is not provided, return the water consumption in liter for each hour for
-        the given day. The first item matches 1h, the last one 24h.
-        Else return the return the water consumption in liter for each day for the
-        given month.
-        The consumption is not available for the last 3 days.
-        """
-        if year < 2001:
-            raise ValueError("year must be greater than 2000")
+        payload = {
+            "name": self.username,
+            "pass": self.password,
+            "form_build_id": form_build_id,
+            "form_id": "user_login_form",
+            "op": "Log in"
+        }
 
-        if date(year, month, day if day else 1) > datetime.now().date():
-            raise ValueError("Cannot retrieve consumption from the future.")
+        _LOGGER.debug("Posting login form with credentials and form_build_id...")
 
-        if day:
-            return await self._get_hourly_consumption(month, year, day)
-        return await self._get_daily_consumption(month, year)
+        async with self.session.post(LOGIN_URL, data=payload) as post_resp:
+            if post_resp.status != 200:
+                raise Exception("Failed to POST login form")
+            post_html = await post_resp.text()
 
-    async def _get_daily_consumption(self, month: int, year: int) -> list[int]:
-        async with self.session.get(DATA_URL.format(month, year)) as response:
-            if response.url.name != "mon-espace-suivi-personnalise.aspx":
-                raise NotAuthenticatedException
-            data = await response.text()
+        if "logout" not in post_html.lower():
+            raise BadCredentialsException("Failed to login. Please check your credentials.")
 
-        reader = csv.DictReader(data.splitlines(), delimiter=CSV_DELIMITER)
-        return [int(row[CONSUMPTION_HEADER]) for row in reader]
+        _LOGGER.info("Login successful!")
+        self.logged_in = True
 
-    async def _get_hourly_consumption(
-        self, month: int, year: int, day: int
-    ) -> list[int]:
-        if date(year, month, day) > self.last_report_date:
-            raise ValueError(
-                f"Hourly consumption is only available for date "
-                f"before {self.last_report_date}"
-            )
+    async def get_consumption(self, month: int, year: int, day: Optional[int] = None) -> List[float]:
+        if not self.logged_in:
+            await self.login()
 
-        async with self.session.get(DATA_URL_DAY.format(month, year, day)) as response:
-            if response.url.name == "inscription.aspx":
-                raise NotAuthenticatedException
-            data = await response.text()
+        # Adjust endpoint for actual US API if different
+        if day is not None:
+            # Example: hourly consumption endpoint
+            url = f"{BASE_URL}/api/consumption/hourly?day={day}&month={month}&year={year}"
+        else:
+            # Example: daily/monthly consumption endpoint
+            url = f"{BASE_URL}/api/consumption/monthly?month={month}&year={year}"
 
-        reader = csv.DictReader(data.splitlines(), delimiter=CSV_DELIMITER)
-        try:
-            return [int(row[CONSUMPTION_HEADER]) for row in reader]
-        except (IndexError, KeyError):
-            # Hourly consumption is not enabled
-            return []
+        _LOGGER.debug(f"Fetching consumption data from {url}")
 
-    async def login(self) -> None:
-        """Log into the Veolia website."""
-        async with await self.session.post(
-            LOGIN_URL,
-            data={
-                "login": self.username,
-                "pass": self.password,
-                "valider-inscription": "Je me connecte",
-            },
-        ) as response:
-            if response.url.name == "connexion.aspx":
-                raise BadCredentialsException
+        async with self.session.get(url) as resp:
+            if resp.status != 200:
+                raise Exception(f"Failed to fetch consumption data: HTTP {resp.status}")
+            data = await resp.json()
+
+        # Parse and normalize data here if needed
+        consumption = data.get("consumption", [])
+        _LOGGER.debug(f"Consumption data received: {consumption}")
+        return consumption
+
+    async def close(self):
+        if not self.session.closed:
+            await self.session.close()
